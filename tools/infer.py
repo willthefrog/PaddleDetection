@@ -166,7 +166,7 @@ def main():
         from ppdet.utils.widerface_eval_utils import bbox2out, get_category_info
 
     anno_file = getattr(test_loader.dataset, 'annotation_file', None)
-    with_background = getattr(test_loader.dataset, 'use_background', True)
+    with_background = not getattr(test_loader, 'yolo_class_fix', False)
     clsid2catid, catid2name = get_category_info(anno_file, with_background)
 
     # whether output bbox is normalized in model output layer
