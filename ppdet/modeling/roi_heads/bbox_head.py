@@ -122,11 +122,6 @@ class TwoFCHead(object):
     def __call__(self, roi_feat):
         fan = roi_feat.shape[1] * roi_feat.shape[2] * roi_feat.shape[3]
 
-        mixed_precision_enabled = mixed_precision_global_state() is not None
-
-        if mixed_precision_enabled:
-            roi_feat = fluid.layers.cast(roi_feat, 'float16')
-
         fc6 = fluid.layers.fc(input=roi_feat,
                               size=self.mlp_dim,
                               act='relu',
@@ -148,9 +143,6 @@ class TwoFCHead(object):
                                         name='fc7_b',
                                         learning_rate=2.,
                                         regularizer=L2Decay(0.)))
-
-        if mixed_precision_enabled:
-            head_feat = fluid.layers.cast(head_feat, 'float32')
 
         return head_feat
 
@@ -210,12 +202,23 @@ class BBoxHead(object):
             bbox_pred(Variable): Output of rpn head with shape of
                 [N, num_anchors * 4, H, W].
         """
+        mp_enabled = (mixed_precision_global_state() is not None
+                      and not isinstance(self.head, XConvNormHead))
+
+        if mp_enabled:
+            roi_feat = fluid.layers.cast(roi_feat, 'float16')
+
         head_feat = self.get_head_feat(roi_feat)
+
         # when ResNetC5 output a single feature map
         if not isinstance(self.head, TwoFCHead) and not isinstance(
                 self.head, XConvNormHead):
             head_feat = fluid.layers.pool2d(
                 head_feat, pool_type='avg', global_pooling=True)
+
+        if mp_enabled:
+            head_feat = fluid.layers.cast(head_feat, 'float32')
+
         cls_score = fluid.layers.fc(input=head_feat,
                                     size=self.num_classes,
                                     act=None,
