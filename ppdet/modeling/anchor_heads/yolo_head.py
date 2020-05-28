@@ -19,8 +19,10 @@ from __future__ import print_function
 from paddle import fluid
 from paddle.fluid.param_attr import ParamAttr
 from paddle.fluid.regularizer import L2Decay
+from paddle.fluid.initializer import Constant
 
 from ppdet.modeling.ops import MultiClassNMS
+from ppdet.modeling.backbones import FPN
 from ppdet.modeling.losses.yolo_loss import YOLOv3Loss
 from ppdet.core.workspace import register
 from ppdet.modeling.ops import DropBlock
@@ -30,7 +32,7 @@ try:
 except Exception:
     from collections import Sequence
 
-__all__ = ['YOLOv3Head', 'YOLOv4Head']
+__all__ = ['YOLOv3Head', 'YOLOv4Head', 'YOLOSEPCHead']
 
 
 @register
@@ -518,5 +520,218 @@ class YOLOv4Head(YOLOv3Head):
                     name=self.prefix_name +
                     "yolo_output.{}.conv.1.bias".format(i)))
             outputs.append(block_out)
+
+
+def iBN(inputs, norm_decay=0., name=''):
+    shapes = [fluid.layers.shape(f) for f in inputs]
+    feats = [fluid.layers.reshape(i, [0, 0, 1, -1]) for i in inputs]
+    sizes = [fluid.layers.shape(f)[-1] for f in feats]
+    cat = fluid.layers.concat(feats, axis=-1)
+
+    bn_param_attr = ParamAttr(
+        regularizer=L2Decay(norm_decay), name=name + '.scale')
+    bn_bias_attr = ParamAttr(
+        regularizer=L2Decay(norm_decay), name=name + '.offset')
+    out = fluid.layers.batch_norm(
+        input=cat,
+        act='relu',
+        param_attr=bn_param_attr,
+        bias_attr=bn_bias_attr,
+        moving_mean_name=name + '.mean',
+        moving_variance_name=name + '.var')
+    split = fluid.layers.split(out, sizes, dim=-1)
+    return [fluid.layers.reshape(s, shape=[0, 0, shapes[i][-2], shapes[i][-1]])
+            for i, s in enumerate(split)]
+
+
+def sepc_conv(feat, num_filters, filter_size, stride=1, deformable=True,
+              name=''):
+    padding = filter_size // 2
+    if not deformable:
+        return fluid.layers.conv2d(
+            input=feat,
+            num_filters=num_filters,
+            filter_size=filter_size,
+            stride=stride,
+            padding=padding,
+            param_attr=ParamAttr(name=name + ".weights"),
+            bias_attr=ParamAttr(name=name + ".bias"))
+
+    offset = fluid.layers.conv2d(
+        input=feat,
+        num_filters=2 * filter_size ** 2,
+        filter_size=filter_size,
+        stride=stride,
+        padding=padding,
+        param_attr=ParamAttr(
+            initializer=Constant(0.0), name=name + ".offset.weight"),
+        bias_attr=ParamAttr(
+            initializer=Constant(0.0), name=name + ".offset.bias"))
+
+    return fluid.layers.deformable_conv(
+        input=feat,
+        offset=offset,
+        mask=None,
+        num_filters=num_filters,
+        filter_size=filter_size,
+        stride=stride,
+        padding=padding,
+        im2col_step=1,
+        param_attr=ParamAttr(name=name + ".weights"),
+        bias_attr=ParamAttr(name=name + ".bias"))
+
+
+def pconv(inputs, index, num_filters, filter_size, norm_decay=0.,
+          deformable=True):
+    outputs = []
+    for lvl, feat in enumerate(inputs):
+        deformable = deformable and lvl != 0
+        out = sepc_conv(feat, num_filters, filter_size, stride=1,
+                        deformable=deformable, name='pconv_{}_1'.format(index))
+        if lvl > 0:
+            below = sepc_conv(inputs[lvl - 1], num_filters, filter_size,
+                              stride=2, deformable=deformable,
+                              name='pconv_{}_2'.format(index))
+            out = fluid.layers.elementwise_add(out, below)
+        if lvl != len(inputs) - 1:
+            above = sepc_conv(inputs[lvl + 1], num_filters, filter_size,
+                              stride=1, deformable=deformable,
+                              name='pconv_{}_0'.format(index))
+            out_shape = fluid.layers.shape(out)[-2:]
+            above = fluid.layers.resize_bilinear(above, out_shape=out_shape)
+            out = fluid.layers.elementwise_add(out, above)
+        outputs.append(out)
+    return iBN(outputs, norm_decay, 'iBN_{}'.format(index))
+
+
+@register
+class YOLOSEPCHead(YOLOv3Head):
+    __inject__ = ['yolo_loss', 'nms', 'fpn']
+    __shared__ = ['num_classes', 'weight_prefix_name']
+
+    def __init__(self,
+                 norm_decay=0.,
+                 num_classes=80,
+                 num_pconvs=4,
+                 num_pconv_chan=256,
+                 pconv_deformable=True,
+                 anchors=[[10, 13], [16, 30], [33, 23], [30, 61], [62, 45],
+                          [59, 119], [116, 90], [156, 198], [373, 326]],
+                 anchor_masks=[[6, 7, 8], [3, 4, 5], [0, 1, 2]],
+                 iou_aware=False,
+                 iou_aware_factor=0.4,
+                 yolo_loss="YOLOv3Loss",
+                 fpn=FPN(
+                     min_level=3,
+                     max_level=6,
+                     num_chan=256,
+                     spatial_scale=[0.03125, 0.0625, 0.125]).__dict__,
+                 nms=MultiClassNMS(
+                     score_threshold=0.01,
+                     nms_top_k=1000,
+                     keep_top_k=100,
+                     nms_threshold=0.45,
+                     background_label=-1).__dict__,
+                 weight_prefix_name='',
+                 downsample=[32, 16, 8],
+                 clip_bbox=True,
+                 scale_x_y=1.):
+        super(YOLOSEPCHead, self).__init__(
+            anchors=anchors,
+            anchor_masks=anchor_masks,
+            nms=nms,
+            num_classes=num_classes,
+            weight_prefix_name=weight_prefix_name,
+            downsample=downsample,
+            scale_x_y=scale_x_y,
+            yolo_loss=yolo_loss,
+            iou_aware=iou_aware,
+            iou_aware_factor=iou_aware_factor,
+            clip_bbox=clip_bbox)
+        self.num_pconvs = num_pconvs
+        self.num_pconv_chan = num_pconv_chan
+        self.pconv_deformable = pconv_deformable
+        self.fpn = fpn
+        if isinstance(fpn, dict):
+            self.fpn = FPN(**fpn)
+        if self.fpn is not None:
+            assert self.fpn.num_chan == num_pconv_chan
+
+    def _parse_anchors(self, anchors):
+        """
+        Check ANCHORS/ANCHOR_MASKS in config and parse mask_anchors
+
+        """
+        self.anchors = []
+        self.mask_anchors = []
+
+        assert len(anchors) > 0, "ANCHORS not set."
+        assert len(self.anchor_masks) > 0, "ANCHOR_MASKS not set."
+
+        for anchor in anchors:
+            assert len(anchor) == 2, "anchor {} len should be 2".format(anchor)
+            self.anchors.extend(anchor)
+
+        anchor_num = len(anchors)
+        for masks in self.anchor_masks:
+            self.mask_anchors.append([])
+            for mask in masks:
+                assert mask < anchor_num, "anchor mask index overflow"
+                self.mask_anchors[-1].extend(anchors[mask])
+
+    def _upsample(self, input, scale=2, name=None):
+        out = fluid.layers.resize_nearest(
+            input=input, scale=float(scale), name=name)
+        return out
+
+    def _get_outputs(self, inputs, is_train=True):
+        if self.fpn is not None:
+            body_dict = {str(i): f for i, f in enumerate(inputs)}
+            feats, scales = self.fpn.get_output(body_dict)
+            feats = list(feats.values())
+            feats.reverse()
+        else:
+            inputs = inputs[-len(self.anchor_masks):]
+            feats = []
+            for i, feat in enumerate(inputs):
+                out = fluid.layers.conv2d(
+                    input=feat,
+                    num_filters=self.num_pconv_chan,
+                    filter_size=1,
+                    stride=1,
+                    padding=0,
+                    param_attr=ParamAttr(
+                        name="contract_{}.weights".format(i)),
+                    bias_attr=ParamAttr(
+                        regularizer=L2Decay(0.),
+                        name="contract_{}.bias".format(i)))
+                feats.append(out)
+
+        for i in range(self.num_pconvs):
+            feats = pconv(feats, i, self.num_pconv_chan, 3,
+                          norm_decay=self.norm_decay,
+                          deformable=self.pconv_deformable)
+
+        feats.reverse()  # small to large order
+        outputs = []
+        for i, feat in enumerate(feats):
+            num_filters = len(self.anchor_masks[i]) * (self.num_classes + 5)
+            if self.iou_aware:
+                num_filters += len(self.anchor_masks[i])
+
+            with fluid.name_scope('yolo_output'):
+                block_out = fluid.layers.conv2d(
+                    input=feat,
+                    num_filters=num_filters,
+                    filter_size=1,
+                    stride=1,
+                    padding=0,
+                    act=None,
+                    param_attr=ParamAttr(
+                        name="yolo_output.{}.conv.weights".format(i)),
+                    bias_attr=ParamAttr(
+                        regularizer=L2Decay(0.),
+                        name="yolo_output.{}.conv.bias".format(i)))
+                outputs.append(block_out)
 
         return outputs
